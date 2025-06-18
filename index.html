@@ -1,0 +1,382 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Interstellar Black Hole Simulation</title>
+    <style>
+      /* Basic styling for the body and canvas */
+      body {
+        margin: 0;
+        overflow: hidden; /* Hide scrollbars */
+        background-color: #000; /* Black background for space */
+        color: #fff; /* White text color */
+        font-family: "Inter", sans-serif; /* Use Inter font */
+      }
+      canvas {
+        display: block; /* Ensure canvas takes full space without extra margins */
+      }
+      /* Styling for the information panel */
+      #info-panel {
+        position: absolute;
+        top: 20px;
+        left: 20px;
+        padding: 15px;
+        background: rgba(0, 0, 0, 0.5); /* Semi-transparent background */
+        border-radius: 10px; /* Rounded corners */
+        max-width: 300px;
+        font-size: 14px;
+        line-height: 1.5;
+        backdrop-filter: blur(5px); /* Blurred background effect */
+        border: 1px solid rgba(255, 255, 255, 0.2); /* Subtle border */
+        z-index: 10; /* Ensure it's above the canvas */
+      }
+      h1 {
+        margin-top: 0;
+        font-size: 20px;
+        color: #fca311; /* Orange heading color */
+      }
+      p {
+        margin-bottom: 0;
+      }
+      a {
+        color: #4dabf7; /* Blue link color */
+        text-decoration: none;
+      }
+      a:hover {
+        text-decoration: underline;
+      }
+    </style>
+    <!-- Link to Google Fonts for Inter -->
+    <link
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;700&display=swap"
+      rel="stylesheet"
+    />
+  </head>
+  <body>
+    <!-- Information panel for user instructions and description -->
+    <div id="info-panel">
+      <h1>Black Hole Simulation</h1>
+      <p>
+        Inspired by "Interstellar", this simulation uses shaders to create the
+        accretion disk and a post-processing pass for the gravitational lensing
+        effect. <br /><br /><strong>Controls:</strong> Drag the mouse to orbit
+        the camera.
+      </p>
+    </div>
+
+    <!-- Three.js library -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <!-- OrbitControls for camera interaction -->
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+
+    <script type="module">
+      // --- Basic Scene Setup ---
+      let scene, camera, renderer, controls;
+      let blackHole, accretionDisk, stars, blackHoleGroup;
+
+      // --- Post-processing and Lensing ---
+      let renderTarget, lensingComposer;
+
+      // --- Shader Uniforms ---
+      // Uniforms passed to the accretion disk shaders
+      const diskUniforms = {
+        uTime: { value: 0.0 }, // Time uniform for animation
+      };
+      // Uniforms passed to the lensing post-processing shader
+      const lensingUniforms = {
+        tDiffuse: { value: null }, // Texture to be lensed (rendered scene)
+        uBlackHolePosition: { value: new THREE.Vector2(0.5, 0.5) }, // Black hole position in screen space
+        uLensingStrength: { value: 0.15 }, // Increased how strong the lensing effect is for more visible distortion
+        uBlackHoleRadius: { value: 0.15 }, // Radius of the black hole for lensing calculations
+      };
+
+      // --- Vertex Shaders ---
+      // Vertex shader for the accretion disk. Passes UVs to fragment shader.
+      const diskVertexShader = `
+            varying vec2 vUv;
+            void main() {
+                vUv = uv; // Pass UV coordinates
+                gl_Position = projectionMatrix * viewMatrix * modelMatrix * vec4(position, 1.0); // Project to screen space
+            }
+        `;
+
+      // Vertex shader for the lensing effect (full screen quad). Simple pass-through.
+      const lensingVertexShader = `
+            varying vec2 vUv;
+            void main() {
+                vUv = uv; // Pass UV coordinates
+                gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); // Project to screen space
+            }
+        `;
+
+      // --- Fragment Shaders ---
+      // Fragment shader for the accretion disk. Creates a glowing, turbulent gradient.
+      const diskFragmentShader = `
+            uniform float uTime; // Time uniform for animation
+            varying vec2 vUv; // UV coordinates from vertex shader
+
+            // Simple pseudo-random noise function (fractal brownian motion inspired)
+            float snoise(vec3 v) {
+                return fract(sin(dot(v, vec3(12.9898, 78.233, 151.7182))) * 43758.5453);
+            }
+
+            void main() {
+                // Calculate distance from the center of the disk in UV space (0 to 1)
+                float dist = length(vUv - 0.5) * 2.0; 
+                
+                // Calculate angle for noise patterns
+                float angle = atan(vUv.y - 0.5, vUv.x - 0.5);
+                // Generate noise based on distance, angle, and time for animated turbulence
+                float noise = snoise(vec3(dist * 5.0 - uTime * 0.2, angle * 10.0, uTime * 0.1));
+                
+                // Define colors for the gradient
+                vec3 colorHot = vec3(1.0, 1.0, 0.9); // Hot (yellowish-white) near center
+                vec3 colorWarm = vec3(1.0, 0.6, 0.0); // Warm (orange)
+                vec3 colorCool = vec3(0.8, 0.2, 0.0); // Cooler (reddish-orange) towards edges
+                
+                // Mix colors based on radial distance
+                vec3 color = mix(colorHot, colorWarm, smoothstep(0.3, 0.6, dist));
+                color = mix(color, colorCool, smoothstep(0.6, 1.0, dist));
+                
+                // Apply noise to color for flickering effect and slight darkening at edges
+                color *= (0.7 + noise * 0.3) * (1.0 - smoothstep(0.8, 1.0, dist));
+                
+                // Calculate alpha for transparency: fade out at outer edges, fade in from inner radius
+                float alpha = (1.0 - smoothstep(0.95, 1.0, dist)) * smoothstep(0.25, 0.3, dist);
+                
+                gl_FragColor = vec4(color, alpha); // Output final color and alpha
+            }
+        `;
+
+      // Fragment shader for the post-processing lensing effect.
+      const lensingFragmentShader = `
+            uniform sampler2D tDiffuse; // The texture containing the rendered scene
+            uniform vec2 uBlackHolePosition; // Screen space position of the black hole
+            uniform float uLensingStrength; // Strength of the lensing effect
+            uniform float uBlackHoleRadius; // Radius of the black hole's "shadow"
+            varying vec2 vUv; // UV coordinates for sampling the texture
+
+            void main() {
+                vec2 toCenter = uBlackHolePosition - vUv; // Vector from current pixel to black hole center
+                float dist = length(toCenter); // Distance from current pixel to black hole center
+                
+                // If the pixel is inside the black hole's shadow radius, make it black
+                if (dist < uBlackHoleRadius) {
+                    gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0); // Black color
+                    return;
+                }
+
+                // Calculate the offset for gravitational lensing.
+                // Light bends more significantly closer to the black hole.
+                // The distortion factor is inversely proportional to distance from the black hole and scales with black hole radius.
+                vec2 offset = toCenter / dist * uLensingStrength / (dist + uBlackHoleRadius * 0.5); 
+                
+                // Sample the diffuse texture with the calculated offset to create the lensing effect
+                vec4 lensedColor = texture2D(tDiffuse, vUv + offset);
+                gl_FragColor = lensedColor; // Output the lensed color
+            }
+        `;
+
+      /**
+       * Initializes the Three.js scene, camera, renderer, controls, and objects.
+       */
+      function init() {
+        // Setup renderer
+        renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(window.devicePixelRatio); // Use device pixel ratio for sharper rendering
+        document.body.appendChild(renderer.domElement); // Add canvas to DOM
+
+        // Create scene and camera
+        scene = new THREE.Scene();
+        camera = new THREE.PerspectiveCamera(
+          75,
+          window.innerWidth / window.innerHeight,
+          0.1,
+          2000
+        );
+        camera.position.set(0, 5, 20); // Initial camera position
+
+        // OrbitControls for interactive camera movement
+        controls = new THREE.OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true; // Enable smooth camera movement
+        controls.dampingFactor = 0.05;
+        controls.minDistance = 5; // Minimum zoom distance
+        controls.maxDistance = 100; // Maximum zoom distance
+        controls.autoRotate = true; // Enable auto-rotation
+        controls.autoRotateSpeed = 0.1; // Speed of auto-rotation
+
+        // Add subtle ambient light
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.1);
+        scene.add(ambientLight);
+
+        createStarfield(); // Create background stars
+
+        // Group to hold black hole, allowing it to move together
+        blackHoleGroup = new THREE.Group();
+        scene.add(blackHoleGroup); // Add the group to the scene
+
+        createBlackHole(); // Create the black hole sphere
+        createAccretionDisk(); // Create the accretion disk using shaders
+
+        setupLensingEffect(); // Setup the post-processing lensing effect
+
+        // Event listener for window resizing
+        window.addEventListener("resize", onWindowResize, false);
+      }
+
+      /**
+       * Creates a starfield background with random white points.
+       */
+      function createStarfield() {
+        const starGeometry = new THREE.BufferGeometry();
+        const starVertices = [];
+        // Generate many random star positions
+        for (let i = 0; i < 20000; i++) {
+          const x = THREE.MathUtils.randFloatSpread(1000); // Random position within a cube of size 1000
+          const y = THREE.MathUtils.randFloatSpread(1000);
+          const z = THREE.MathUtils.randFloatSpread(1000);
+          starVertices.push(x, y, z);
+        }
+        starGeometry.setAttribute(
+          "position",
+          new THREE.Float32BufferAttribute(starVertices, 3)
+        ); // Set positions
+        // Material for the stars
+        const starMaterial = new THREE.PointsMaterial({
+          color: 0xffffff,
+          size: 0.05,
+          transparent: true,
+          opacity: 0.8,
+          blending: THREE.AdditiveBlending,
+        });
+        stars = new THREE.Points(starGeometry, starMaterial);
+        scene.add(stars);
+      }
+
+      /**
+       * Creates the central black sphere representing the black hole's event horizon.
+       */
+      function createBlackHole() {
+        const geometry = new THREE.SphereGeometry(2, 64, 64); // Sphere geometry
+        const material = new THREE.MeshBasicMaterial({ color: 0x000000 }); // Pure black material
+        blackHole = new THREE.Mesh(geometry, material);
+        blackHoleGroup.add(blackHole); // Add to black hole group
+      }
+
+      /**
+       * Creates the accretion disk using a single shader material.
+       */
+      function createAccretionDisk() {
+        const geometry = new THREE.RingGeometry(2.5, 6, 128); // Ring geometry for the disk
+
+        // Single material for the accretion disk
+        const accretionDiskMaterial = new THREE.ShaderMaterial({
+          uniforms: diskUniforms, // Pass time uniform
+          vertexShader: diskVertexShader, // Custom vertex shader
+          fragmentShader: diskFragmentShader, // Custom fragment shader for gradient/noise
+          side: THREE.DoubleSide, // Render both sides of the disk
+          transparent: true, // Enable transparency
+          blending: THREE.AdditiveBlending, // Additive blending for glow effect
+          depthWrite: false, // Don't write to depth buffer to avoid sorting issues with transparency
+        });
+
+        accretionDisk = new THREE.Mesh(geometry, accretionDiskMaterial);
+        accretionDisk.rotation.x = Math.PI / 2; // Rotate to be horizontal
+        blackHoleGroup.add(accretionDisk); // Add to black hole group so it moves with the black hole
+      }
+
+      /**
+       * Sets up the post-processing pipeline for gravitational lensing.
+       */
+      function setupLensingEffect() {
+        // Render target to render the scene (excluding black hole initially) into a texture
+        renderTarget = new THREE.WebGLRenderTarget(
+          window.innerWidth,
+          window.innerHeight
+        );
+
+        // Create a full-screen quad for the lensing effect
+        const lensingGeometry = new THREE.PlaneGeometry(2, 2);
+        lensingUniforms.tDiffuse.value = renderTarget.texture; // Assign the rendered texture to the uniform
+        // Material for the lensing shader
+        const lensingMaterial = new THREE.ShaderMaterial({
+          uniforms: lensingUniforms, // Pass lensing uniforms
+          vertexShader: lensingVertexShader, // Simple vertex shader
+          fragmentShader: lensingFragmentShader, // Lensing fragment shader
+        });
+
+        const lensingMesh = new THREE.Mesh(lensingGeometry, lensingMaterial); // Mesh for the quad
+        // Composer object to handle the post-processing pass
+        lensingComposer = {
+          scene: new THREE.Scene(), // A separate scene for the post-processing quad
+          camera: new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1), // Orthographic camera for full screen
+          mesh: lensingMesh, // The quad mesh
+        };
+        lensingComposer.scene.add(lensingComposer.mesh); // Add quad to composer's scene
+      }
+
+      /**
+       * Handles window resizing to maintain responsiveness.
+       */
+      function onWindowResize() {
+        camera.aspect = window.innerWidth / window.innerHeight; // Update camera aspect ratio
+        camera.updateProjectionMatrix(); // Recalculate projection matrix
+        renderer.setSize(window.innerWidth, window.innerHeight); // Resize renderer
+        renderTarget.setSize(window.innerWidth, window.innerHeight); // Resize render target
+      }
+
+      /**
+       * Animation loop.
+       * @param {number} time - The current time in milliseconds.
+       */
+      function animate(time) {
+        requestAnimationFrame(animate); // Request next animation frame
+
+        const elapsedTime = time * 0.0001; // Convert time to a smaller, more manageable value
+
+        diskUniforms.uTime.value = elapsedTime; // Update time uniform for disk animation
+
+        // Auto-rotate the black hole group (including the disk)
+        blackHoleGroup.rotation.y += 0.005; // Make the black hole and disk spin
+
+        controls.update(); // Update orbit controls
+
+        // Calculate black hole's screen position for the lensing shader
+        const screenPosition = new THREE.Vector3();
+        blackHole.getWorldPosition(screenPosition);
+        screenPosition.project(camera); // Project world position to screen space
+        // Normalize screen coordinates to 0-1 range for shader uniform
+        lensingUniforms.uBlackHolePosition.value.x = (screenPosition.x + 1) / 2;
+        lensingUniforms.uBlackHolePosition.value.y = (screenPosition.y + 1) / 2;
+
+        // --- Pass 1: Render scene objects (stars, accretion disk) to renderTarget for lensing ---
+        blackHole.visible = false; // Hide the black hole sphere for this pass, it won't be lensed
+        // The accretionDisk is part of blackHoleGroup, which is in the scene, so it will be rendered.
+        renderer.setRenderTarget(renderTarget);
+        renderer.clear(); // Clear the render target's color and depth buffers
+        renderer.render(scene, camera);
+
+        // --- Pass 2: Apply lensing shader to renderTarget and render to screen ---
+        renderer.setRenderTarget(null); // Set render target back to screen
+        renderer.clear(); // Clear the screen's color and depth buffers
+        renderer.render(lensingComposer.scene, lensingComposer.camera); // Render the lensed content
+
+        // --- Pass 3: Render the actual black hole sphere on top (un-lensed) ---
+        renderer.autoClear = false; // Prevent auto-clearing the screen buffer
+        renderer.clearDepth(); // Only clear depth buffer to ensure black hole is drawn on top
+        blackHole.visible = true; // Make the black hole sphere visible again
+        // Accretion disk is intentionally not drawn again here, as its lensed version is already on screen from Pass 2.
+        renderer.render(scene, camera); // This renders the entire scene again, but only objects with depth (like blackHole) will appear
+        renderer.autoClear = true; // Reset autoClear for the next frame
+      }
+
+      // Initialize and start the animation when the window loads
+      window.onload = function () {
+        init(); // Initialize Three.js
+        animate(0); // Start the animation loop
+      };
+    </script>
+  </body>
+</html>
